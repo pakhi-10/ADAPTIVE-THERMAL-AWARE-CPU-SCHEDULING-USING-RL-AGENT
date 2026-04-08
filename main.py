@@ -1,254 +1,263 @@
 """
 main.py — CSD 204 OS Project
-Author: P
+Authors: P + S
 
-Entry point for the Thermal-Aware CPU Scheduling project.
-
-What it does
-------------
-  1. Parses CLI flags (--quick, --skip-train, --seed, --tasks).
-  2. Optionally trains the DQN agent (or loads a saved model).
-  3. Runs all four schedulers on an identical task set:
-       • Round Robin  (thermal-blind baseline)
-       • SJF          (thermal-blind baseline)
-       • EFS-Inspired (energy-fair, Qiao et al.)
-       • DQN Agent    (novel thermal-inertia RL approach)
-  4. Prints a formatted comparison table.
-  5. Declares a winner on each metric.
+Runs all schedulers on the same task set (seed=42) and produces:
+  1. Bar chart  — avg_temp, peak_temp, throttle_events, ticks
+                  comparing RR, SJF, EFS, and the balanced DQN agent
+  2. Pareto plot — avg_temp vs ticks for all 7 DQN agents + 3 baselines
+                   This is our novel contribution (Option 2)
 
 Usage
 -----
-    python main.py                   # full training + all schedulers
-    python main.py --quick           # 10k-step training (fast smoke test)
-    python main.py --skip-train      # load existing dqn_thermal.zip, skip training
-    python main.py --tasks 30        # use 30 tasks instead of default 20
-    python main.py --seed 7          # change random seed for task generation
-    python main.py --quick --tasks 10 --seed 99   # combine flags freely
+    python main.py              # uses pre-trained models (must run rl_agent.py first)
+    python main.py --retrain    # retrains all DQN agents before plotting
+    python main.py --quick      # retrain with fewer steps (for testing)
 """
 
-import argparse
-import copy
-import os
 import sys
+import os
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
-# ── project modules ───────────────────────────────────────────────────────────
-from simulator  import generate_tasks
-from schedulers import run_round_robin, run_sjf, run_efs
-from rl_agent   import train, evaluate, MODEL_PATH, FULL_TIMESTEPS, QUICK_TIMESTEPS
+# ── project imports ───────────────────────────────────────────────────────────
+from simulator   import generate_tasks
+from schedulers  import run_round_robin, run_sjf, run_efs
+from rl_agent    import train_all, load_results, MODELS_DIR
+from gym_env     import ThermalCPUEnv
+from stable_baselines3 import DQN
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  CLI argument parsing
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Thermal-Aware CPU Scheduling — CSD 204 OS Project"
-    )
-    parser.add_argument(
-        "--quick",
-        action="store_true",
-        help="Use 10k training steps instead of 100k (fast smoke test).",
-    )
-    parser.add_argument(
-        "--skip-train",
-        action="store_true",
-        help="Skip training entirely and load an existing dqn_thermal.zip.",
-    )
-    parser.add_argument(
-        "--tasks",
-        type=int,
-        default=20,
-        metavar="N",
-        help="Number of tasks to schedule (default: 20).",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        metavar="S",
-        help="Random seed for task generation (default: 42).",
-    )
-    return parser.parse_args()
+PLOTS_DIR = "plots"
+os.makedirs(PLOTS_DIR, exist_ok=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Metric normalisation
-#  Baseline schedulers and rl_agent.evaluate() use slightly different key names.
-#  This function returns a unified dict so the comparison table is simple.
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Step 1: Run baseline schedulers ──────────────────────────────────────────
 
-def normalise_metrics(raw: dict) -> dict:
+def normalise_keys(m: dict) -> dict:
     """
-    Returns a unified metrics dict with four keys:
-        avg_temp  | peak_temp  | throttles  | ticks
-    Works for both baseline-scheduler output and rl_agent.evaluate() output.
+    Map schedulers.py key names to the common keys used throughout main.py.
+    schedulers.py uses: avg_temperature, peak_temperature,
+                        total_throttle_events, tick
+    common keys used:   avg_temp, peak_temp, throttle_events, ticks
     """
     return {
-        "avg_temp"  : raw.get("avg_temperature",        raw.get("avg_temp",   float("nan"))),
-        "peak_temp" : raw.get("peak_temperature",       raw.get("peak_temp",  float("nan"))),
-        "throttles" : raw.get("total_throttle_events",  raw.get("throttle_events", 0)),
-        "ticks"     : raw.get("tick",                   raw.get("ticks",      0)),
+        "avg_temp"        : m.get("avg_temperature",       m.get("avg_temp", 0)),
+        "peak_temp"       : m.get("peak_temperature",      m.get("peak_temp", 0)),
+        "throttle_events" : m.get("total_throttle_events", m.get("throttle_events", 0)),
+        "ticks"           : m.get("tick",                  m.get("ticks", 0)),
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Print helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-LINE  = "=" * 72
-DLINE = "─" * 72
-
-def section(title: str):
-    print(f"\n{LINE}")
-    print(f"  {title}")
-    print(LINE)
-
-
-def print_comparison_table(results: list[dict]):
+def run_baselines() -> dict:
     """
-    Prints a formatted comparison table and highlights the best value
-    for each metric (lower is better for all four metrics).
+    Run RR, SJF, EFS on generate_tasks(seed=42).
+    Returns dict of {scheduler_name: metrics_dict}.
     """
-    section("RESULTS — Scheduler Comparison")
+    tasks = generate_tasks(seed=42)
 
-    header = (
-        f"  {'Scheduler':<30} {'Avg Temp':>9} {'Peak Temp':>10} "
-        f"{'Throttles':>10} {'Ticks':>7}"
-    )
-    print(header)
-    print(f"  {DLINE}")
+    print("Running baseline schedulers …")
+    rr  = normalise_keys(run_round_robin(tasks));  print("  Round Robin  ✓")
+    sjf = normalise_keys(run_sjf(tasks));          print("  SJF          ✓")
+    efs = normalise_keys(run_efs(tasks));          print("  EFS          ✓")
 
-    # find best (minimum) value per metric for highlighting
-    metrics_keys = ["avg_temp", "peak_temp", "throttles", "ticks"]
-    best = {k: min(r["metrics"][k] for r in results) for k in metrics_keys}
-
-    for r in results:
-        m    = r["metrics"]
-        name = r["name"]
-
-        def fmt(key: str, fmt_str: str) -> str:
-            val  = m[key]
-            mark = " ★" if val == best[key] else "  "
-            return format(val, fmt_str) + mark
-
-        print(
-            f"  {name:<30} "
-            f"{fmt('avg_temp',  '.2f'):>11} "
-            f"{fmt('peak_temp', '.2f'):>12} "
-            f"{fmt('throttles', 'd'):>12} "
-            f"{fmt('ticks',     'd'):>9}"
-        )
-
-    print(f"  {DLINE}")
-    print("  ★ = best value for that metric (lower is better for all)\n")
-
-
-def print_winner_summary(results: list[dict]):
-    """Prints one-line winner per metric."""
-    section("WINNER PER METRIC")
-    metrics_keys = ["avg_temp", "peak_temp", "throttles", "ticks"]
-    labels = {
-        "avg_temp"  : "Lowest average temperature",
-        "peak_temp" : "Lowest peak temperature   ",
-        "throttles" : "Fewest throttle events    ",
-        "ticks"     : "Completed in fewest ticks ",
+    return {
+        "Round Robin" : rr,
+        "SJF"         : sjf,
+        "EFS"         : efs,
     }
-    for key in metrics_keys:
-        winner  = min(results, key=lambda r: r["metrics"][key])
-        val     = winner["metrics"][key]
-        display = f"{val:.2f}" if isinstance(val, float) else str(val)
-        print(f"  {labels[key]} → {winner['name']}  ({display})")
-    print()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Main
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Step 2: Get DQN Pareto results ───────────────────────────────────────────
 
-def main():
-    args = parse_args()
+def get_dqn_results(retrain: bool = False, quick: bool = False) -> list:
+    results_path = os.path.join(MODELS_DIR, "pareto_results.json")
 
-    print(f"\n{'=' * 72}")
-    print(f"  CSD 204 — Thermal-Aware CPU Scheduling  |  OS Project")
-    print(f"{'=' * 72}")
-    print(f"  Tasks  : {args.tasks}")
-    print(f"  Seed   : {args.seed}")
-    print(f"  Mode   : {'quick (10k steps)' if args.quick else 'full (100k steps)'}")
-    print(f"  Train  : {'NO — loading saved model' if args.skip_train else 'YES'}")
-
-    # ── Step 1 : Generate tasks (one set, shared across ALL schedulers) ───────
-    section("STEP 1 — Generating Task Set")
-    original_tasks = generate_tasks(num_tasks=args.tasks, seed=args.seed)
-    print(f"  Generated {len(original_tasks)} tasks  (seed={args.seed})")
-    print(f"  Sample: {original_tasks[0]}  …  {original_tasks[-1]}")
-
-    # ── Step 2 : Train / load DQN agent ──────────────────────────────────────
-    section("STEP 2 — DQN Agent")
-
-    if args.skip_train:
-        model_file = MODEL_PATH + ".zip"
-        if not os.path.exists(model_file):
-            print(f"  ERROR: --skip-train was set but '{model_file}' was not found.")
-            print(f"         Run without --skip-train first to train and save the model.")
-            sys.exit(1)
-        print(f"  Skipping training — using saved model: {model_file}")
+    if retrain or not os.path.exists(results_path):
+        from rl_agent import FULL_TIMESTEPS, QUICK_TIMESTEPS
+        timesteps = QUICK_TIMESTEPS if quick else FULL_TIMESTEPS
+        return train_all(timesteps=timesteps)
     else:
-        timesteps = QUICK_TIMESTEPS if args.quick else FULL_TIMESTEPS
-        print(f"  Training DQN for {timesteps:,} steps …")
-        train(timesteps=timesteps)
+        print("Loading pre-trained DQN results …")
+        results = load_results()
+        print(f"  Loaded {len(results)} agent results ✓")
+        return results
 
-    # ── Step 3 : Run baseline schedulers ──────────────────────────────────────
-    section("STEP 3 — Running Baseline Schedulers")
 
-    # deep-copy for each scheduler — identical starting conditions
-    tasks_rr  = copy.deepcopy(original_tasks)
-    tasks_sjf = copy.deepcopy(original_tasks)
-    tasks_efs = copy.deepcopy(original_tasks)
+# ── Plot 1: Bar chart comparison ─────────────────────────────────────────────
 
-    print("  Running Round Robin …", end="  ", flush=True)
-    rr_raw  = run_round_robin(tasks_rr)
-    print("done ✓")
+def plot_bar_comparison(baselines: dict, dqn_results: list):
+    """
+    Bar chart comparing RR, SJF, EFS, and balanced DQN on 4 metrics.
+    Uses the 'balanced' DQN agent (w_dtdt=0.05) as the representative DQN result.
+    """
+    # find balanced agent
+    balanced = next((r for r in dqn_results if r["label"] == "balanced"), dqn_results[0])
 
-    print("  Running SJF         …", end="  ", flush=True)
-    sjf_raw = run_sjf(tasks_sjf)
-    print("done ✓")
+    schedulers = list(baselines.keys()) + ["DQN (balanced)"]
+    all_metrics = list(baselines.values()) + [balanced]
 
-    print("  Running EFS         …", end="  ", flush=True)
-    efs_raw = run_efs(tasks_efs)
-    print("done ✓")
-
-    # ── Step 4 : Evaluate DQN agent ───────────────────────────────────────────
-    section("STEP 4 — Evaluating DQN Agent")
-    print("  Running one deterministic episode with trained model …", end="  ", flush=True)
-    dqn_raw = evaluate(model_path=MODEL_PATH, seed=args.seed)
-    print("done ✓")
-
-    # ── Step 5 : Build results list and print table ───────────────────────────
-    results = [
-        {"name": "Round Robin",              "metrics": normalise_metrics(rr_raw)},
-        {"name": "SJF",                      "metrics": normalise_metrics(sjf_raw)},
-        {"name": "EFS-Inspired (Qiao et al.)","metrics": normalise_metrics(efs_raw)},
-        {"name": "DQN — Thermal Inertia (ours)", "metrics": normalise_metrics(dqn_raw)},
+    metrics_to_plot = [
+        ("avg_temp",        "Average Temperature (°C)",  "tomato"),
+        ("peak_temp",       "Peak Temperature (°C)",     "orangered"),
+        ("throttle_events", "Throttle Events",           "steelblue"),
+        ("ticks",           "Ticks to Complete",         "mediumseagreen"),
     ]
 
-    print_comparison_table(results)
-    print_winner_summary(results)
+    fig, axes = plt.subplots(1, 4, figsize=(16, 5))
+    fig.suptitle(
+        "Scheduler Comparison — CSD 204 OS Project\n"
+        "Adaptive Thermal-Aware CPU Scheduling using Reinforcement Learning",
+        fontsize=13, fontweight="bold", y=1.02
+    )
 
-    # ── Optional: per-core detail for baseline schedulers ─────────────────────
-    section("PER-CORE DETAIL  (baseline schedulers)")
-    for raw, label in [(rr_raw, "Round Robin"), (sjf_raw, "SJF"), (efs_raw, "EFS-Inspired")]:
-        print(f"\n  {label}")
-        if "per_core_throttle" in raw:
-            print(f"    Throttle counts : {raw['per_core_throttle']}")
-        if "per_core_energy" in raw:
-            energy = [f"{e:.1f}" for e in raw["per_core_energy"]]
-            print(f"    Energy proxy    : {energy}")
+    for ax, (key, ylabel, color) in zip(axes, metrics_to_plot):
+        values = [m[key] for m in all_metrics]
+        bars   = ax.bar(schedulers, values, color=color, alpha=0.85, edgecolor="black", linewidth=0.7)
+        ax.set_title(ylabel, fontsize=11, fontweight="bold")
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.set_xticks(range(len(schedulers)))
+        ax.set_xticklabels(schedulers, rotation=20, ha="right", fontsize=9)
+        ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+        ax.set_axisbelow(True)
 
-    print(f"\n{'=' * 72}")
-    print("  All experiments complete ✓")
-    print(f"{'=' * 72}\n")
+        # value labels on top of bars
+        for bar, val in zip(bars, values):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.5,
+                f"{val:.1f}",
+                ha="center", va="bottom", fontsize=8
+            )
 
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "bar_comparison.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"\nBar chart saved → {path}")
+
+
+# ── Plot 2: Pareto frontier ───────────────────────────────────────────────────
+
+def plot_pareto(baselines: dict, dqn_results: list):
+    """
+    Pareto frontier plot: avg_temp (X) vs ticks (Y).
+
+    DQN agents form a curve — the Pareto frontier.
+    Baseline schedulers appear as single points.
+    Points toward the bottom-left are better (cooler AND faster).
+    """
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    # ── plot DQN Pareto frontier ──────────────────────────────────────────────
+    dqn_temps = [r["avg_temp"] for r in dqn_results]
+    dqn_ticks = [r["ticks"]    for r in dqn_results]
+    dqn_labels= [r["label"]    for r in dqn_results]
+
+    # sort by avg_temp so the line connects points in order
+    sorted_points = sorted(zip(dqn_temps, dqn_ticks, dqn_labels))
+    sx, sy, sl    = zip(*sorted_points)
+
+    ax.plot(sx, sy, "o-", color="royalblue", linewidth=2,
+            markersize=8, markerfacecolor="white", markeredgewidth=2,
+            label="DQN agents (Pareto frontier)", zorder=3)
+
+    # label each DQN point
+    for x, y, lbl in zip(sx, sy, sl):
+        ax.annotate(
+            lbl, (x, y),
+            textcoords="offset points", xytext=(6, 6),
+            fontsize=8, color="royalblue"
+        )
+
+    # ── shade the Pareto frontier region ─────────────────────────────────────
+    ax.fill_between(sx, sy, max(sy) * 1.1,
+                    alpha=0.07, color="royalblue", label="_nolegend_")
+
+    # ── plot baseline schedulers ──────────────────────────────────────────────
+    colors  = {"Round Robin": "tomato", "SJF": "darkorange", "EFS": "mediumseagreen"}
+    markers = {"Round Robin": "s",      "SJF": "^",          "EFS": "D"}
+
+    for name, metrics in baselines.items():
+        ax.scatter(
+            metrics["avg_temp"], metrics["ticks"],
+            s=120, color=colors[name], marker=markers[name],
+            zorder=4, label=name, edgecolors="black", linewidth=0.8
+        )
+        ax.annotate(
+            name, (metrics["avg_temp"], metrics["ticks"]),
+            textcoords="offset points", xytext=(6, -12),
+            fontsize=9, color=colors[name], fontweight="bold"
+        )
+
+    # ── labels and formatting ─────────────────────────────────────────────────
+    ax.set_xlabel("Average Temperature (°C)", fontsize=12)
+    ax.set_ylabel("Ticks to Complete", fontsize=12)
+    ax.set_title(
+        "Pareto Frontier: Thermal Safety vs Completion Speed\n"
+        "Novel Contribution — Multi-Objective DQN Scheduling Analysis",
+        fontsize=13, fontweight="bold"
+    )
+
+    ax.legend(fontsize=10, loc="upper left")
+    ax.grid(True, linestyle="--", alpha=0.4)
+
+    # annotation explaining the plot
+    ax.text(
+        0.98, 0.02,
+        "← Bottom-left is better\n(cooler AND faster)",
+        transform=ax.transAxes,
+        ha="right", va="bottom", fontsize=9,
+        color="gray", style="italic"
+    )
+
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "pareto_frontier.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Pareto plot saved  → {path}")
+
+
+# ── Print results table ───────────────────────────────────────────────────────
+
+def print_table(baselines: dict, dqn_results: list):
+    print("\n" + "=" * 70)
+    print("RESULTS TABLE (Dong et al. Table V format)")
+    print("=" * 70)
+    print(f"{'Scheduler':<20} {'avg_temp':>10} {'peak_temp':>10} "
+          f"{'throttles':>10} {'ticks':>8}")
+    print("-" * 70)
+
+    for name, m in baselines.items():
+        print(f"{name:<20} {m['avg_temp']:>9.1f}°C {m['peak_temp']:>9.1f}°C "
+              f"{m['throttle_events']:>10} {m['ticks']:>8}")
+
+    print("-" * 70)
+    for r in dqn_results:
+        label = f"DQN ({r['label']})"
+        print(f"{label:<20} {r['avg_temp']:>9.1f}°C {r['peak_temp']:>9.1f}°C "
+              f"{r['throttle_events']:>10} {r['ticks']:>8}")
+
+    print("=" * 70)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    retrain = "--retrain" in sys.argv
+    quick   = "--quick"   in sys.argv
+
+    print("=" * 50)
+    print("CSD 204 — Thermal-Aware Scheduling Comparison")
+    print("=" * 50)
+
+    baselines   = run_baselines()
+    dqn_results = get_dqn_results(retrain=retrain, quick=quick)
+
+    print_table(baselines, dqn_results)
+    plot_bar_comparison(baselines, dqn_results)
+    plot_pareto(baselines, dqn_results)
+
+    print("\nAll plots saved to /plots/")
+    print("Done ✓")

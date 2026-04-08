@@ -2,74 +2,62 @@
 rl_agent.py — CSD 204 OS Project
 Author: P
 
-Trains a DQN agent on ThermalCPUEnv using Stable Baselines3.
-Saves the trained model as dqn_thermal.zip for use in main.py.
+Trains multiple DQN agents across different reward weight combinations.
+Each agent represents a different thermal vs completion trade-off.
+Results are used to plot the Pareto frontier in main.py.
 
 Usage
 -----
-    python rl_agent.py            # full training (~100k steps, ~5 mins)
-    python rl_agent.py --quick    # short test run (10k steps, confirms no crash)
+    python rl_agent.py            # full training (~5–10 mins)
+    python rl_agent.py --quick    # quick test (confirms no crash, ~1 min)
 """
 
 import sys
 import os
+import json
 import numpy as np
 
 from stable_baselines3 import DQN
 from stable_baselines3.common.env_checker import check_env
-from stable_baselines3.common.callbacks import BaseCallback
 
 from gym_env import ThermalCPUEnv
 
-# ── paths ─────────────────────────────────────────────────────────────────────
-MODEL_PATH = "dqn_thermal"          # SB3 saves as dqn_thermal.zip
-LOG_DIR    = "./logs/"
+# ── output folder for saved models ───────────────────────────────────────────
+MODELS_DIR = "models"
+os.makedirs(MODELS_DIR, exist_ok=True)
 
-# ── training config ───────────────────────────────────────────────────────────
+# ── Pareto sweep: (w_dtdt, w_completion) pairs ───────────────────────────────
+# w_dtdt       = how much to penalise rising temperature
+# w_completion = how much to reward finishing tasks
+# Low w_dtdt  → agent is aggressive, fast but hot
+# High w_dtdt → agent is cautious, cool but slower
+WEIGHT_CONFIGS = [
+    {"w_dtdt": 0.01, "w_completion": 3.0,  "label": "aggressive"},
+    {"w_dtdt": 0.03, "w_completion": 2.5,  "label": "fast"},
+    {"w_dtdt": 0.05, "w_completion": 2.0,  "label": "balanced"},
+    {"w_dtdt": 0.10, "w_completion": 1.5,  "label": "cautious"},
+    {"w_dtdt": 0.20, "w_completion": 1.0,  "label": "cool"},
+    {"w_dtdt": 0.40, "w_completion": 0.5,  "label": "very_cool"},
+    {"w_dtdt": 0.60, "w_completion": 0.2,  "label": "thermal_safe"},
+]
+
 FULL_TIMESTEPS  = 100_000
 QUICK_TIMESTEPS = 10_000
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Progress callback — prints a line every 10k steps so you can see it running
-# ────────────────────────────────────────────────────────────────────────────
+# ── Train one agent ───────────────────────────────────────────────────────────
 
-class ProgressCallback(BaseCallback):
-    def __init__(self, print_every: int = 10_000):
-        super().__init__()
-        self.print_every = print_every
+def train_one(w_dtdt: float, w_completion: float, label: str,
+              timesteps: int = FULL_TIMESTEPS) -> str:
+    """
+    Train a single DQN agent with given reward weights.
+    Saves model to models/dqn_{label}.zip
+    Returns the saved model path.
+    """
+    print(f"\n  Training '{label}'  (w_dtdt={w_dtdt}, w_completion={w_completion}) …")
 
-    def _on_step(self) -> bool:
-        if self.num_timesteps % self.print_every == 0:
-            print(f"  Step {self.num_timesteps:>8,} | "
-                  f"episodes={self.model._episode_num}")
-        return True   # return False to stop training early
+    env = ThermalCPUEnv(w_dtdt=w_dtdt, w_completion=w_completion, seed=42)
 
-
-# ────────────────────────────────────────────────────────────────────────────
-# Train
-# ────────────────────────────────────────────────────────────────────────────
-
-def train(timesteps: int = FULL_TIMESTEPS):
-    print(f"\n=== DQN Training — {timesteps:,} steps ===\n")
-
-    env = ThermalCPUEnv(seed=42)
-
-    # sanity check before we hand it to SB3
-    print("Checking environment …")
-    check_env(env)
-    print("check_env passed ✓\n")
-
-    # ── DQN hyperparameters ───────────────────────────────────────────────────
-    # Chosen to match a small discrete-action problem:
-    # - learning_rate   : 1e-3  (standard starting point)
-    # - buffer_size     : 50k   (enough replay diversity without huge RAM)
-    # - learning_starts : 1k    (collect some experience before first update)
-    # - batch_size      : 64    (stable gradient estimates)
-    # - target_update_interval: 500 (frequent enough for short episodes)
-    # - exploration_fraction  : 0.3  (explore for first 30% of training)
-    # - exploration_final_eps : 0.05 (5% random actions at end)
-    # - policy "MlpPolicy" : simple feed-forward network, fits our 16-dim state
     model = DQN(
         policy                 = "MlpPolicy",
         env                    = env,
@@ -81,77 +69,116 @@ def train(timesteps: int = FULL_TIMESTEPS):
         target_update_interval = 500,
         exploration_fraction   = 0.3,
         exploration_final_eps  = 0.05,
-        verbose                = 0,          # we use our own callback
+        verbose                = 0,
         tensorboard_log        = None,
         seed                   = 42,
     )
 
-    print("Training started …")
-    model.learn(
-        total_timesteps = timesteps,
-        callback        = ProgressCallback(print_every=max(timesteps // 10, 1000)),
-        progress_bar    = False,
-    )
+    model.learn(total_timesteps=timesteps, progress_bar=False)
 
-    model.save(MODEL_PATH)
-    print(f"\nModel saved → {MODEL_PATH}.zip ✓")
+    path = os.path.join(MODELS_DIR, f"dqn_{label}")
+    model.save(path)
+    print(f"  Saved → {path}.zip ✓")
     env.close()
-    return model
+    return path
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Evaluate — runs one episode with the trained model, returns metrics dict
-# This is called by main.py to get DQN results for comparison
-# ────────────────────────────────────────────────────────────────────────────
+# ── Evaluate one saved model ──────────────────────────────────────────────────
 
-def evaluate(model_path: str = MODEL_PATH, seed: int = 42) -> dict:
+def evaluate(model_path: str, label: str, seed: int = 42) -> dict:
     """
-    Load a saved DQN model and run one deterministic episode.
-
-    Returns a metrics dict with the same keys as the other schedulers:
-        avg_temp, peak_temp, throttle_events, ticks
-    So main.py can treat all four schedulers identically.
+    Run one deterministic episode with a saved model.
+    Returns metrics dict compatible with schedulers.py output.
     """
     env   = ThermalCPUEnv(seed=seed)
     model = DQN.load(model_path, env=env)
 
-    obs, _     = env.reset()
-    done       = False
-    temp_log   = []
+    obs, _   = env.reset()
+    done     = False
+    temp_log = []
+    total_throttle = 0
 
     while not done:
         action, _ = model.predict(obs, deterministic=True)
         obs, _, terminated, truncated, info = env.step(int(action))
         temp_log.append(info["core_temps"])
+        total_throttle += info["throttle_events"]
         done = terminated or truncated
 
     env.close()
 
-    # flatten all per-tick core temperatures
     all_temps = [t for tick in temp_log for t in tick]
 
     return {
+        "label"           : label,
         "avg_temp"        : float(np.mean(all_temps)),
         "peak_temp"       : float(np.max(all_temps)),
-        "throttle_events" : info.get("throttle_events", 0),  # last tick value
+        "throttle_events" : total_throttle,
         "ticks"           : len(temp_log),
     }
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ────────────────────────────────────────────────────────────────────────────
+# ── Train all + evaluate all ──────────────────────────────────────────────────
+
+def train_all(timesteps: int = FULL_TIMESTEPS) -> list:
+    """
+    Train one DQN agent per weight config in WEIGHT_CONFIGS.
+    Returns list of metrics dicts for all agents.
+    Called by main.py.
+    """
+    print(f"\n=== Pareto Sweep Training — {len(WEIGHT_CONFIGS)} agents × "
+          f"{timesteps:,} steps each ===")
+
+    # sanity check env once before training loop
+    check_env(ThermalCPUEnv(seed=42))
+    print("check_env passed ✓")
+
+    results = []
+    for cfg in WEIGHT_CONFIGS:
+        path    = train_one(
+            w_dtdt      = cfg["w_dtdt"],
+            w_completion= cfg["w_completion"],
+            label       = cfg["label"],
+            timesteps   = timesteps,
+        )
+        metrics = evaluate(path, label=cfg["label"])
+        metrics["w_dtdt"]       = cfg["w_dtdt"]
+        metrics["w_completion"] = cfg["w_completion"]
+        results.append(metrics)
+        print(f"  → avg_temp={metrics['avg_temp']:.1f}°C  "
+              f"ticks={metrics['ticks']}  "
+              f"throttles={metrics['throttle_events']}")
+
+    # save results to JSON so main.py can load without retraining
+    results_path = os.path.join(MODELS_DIR, "pareto_results.json")
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nAll results saved → {results_path}")
+
+    return results
+
+
+def load_results() -> list:
+    """Load previously saved Pareto results (skip retraining)."""
+    path = os.path.join(MODELS_DIR, "pareto_results.json")
+    with open(path) as f:
+        return json.load(f)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    quick = "--quick" in sys.argv
+    quick     = "--quick" in sys.argv
     timesteps = QUICK_TIMESTEPS if quick else FULL_TIMESTEPS
 
-    model = train(timesteps=timesteps)
+    results = train_all(timesteps=timesteps)
 
-    print("\n=== Quick evaluation of trained model ===")
-    metrics = evaluate()
-    print(f"  avg_temp        : {metrics['avg_temp']:.2f} °C")
-    print(f"  peak_temp       : {metrics['peak_temp']:.2f} °C")
-    print(f"  throttle_events : {metrics['throttle_events']}")
-    print(f"  ticks           : {metrics['ticks']}")
-    print("\nAll done ✓")
+    print("\n=== Final Pareto Results ===")
+    print(f"{'Label':<15} {'w_dtdt':>8} {'w_comp':>8} "
+          f"{'avg_temp':>10} {'ticks':>8} {'throttles':>10}")
+    print("-" * 65)
+    for r in results:
+        print(f"{r['label']:<15} {r['w_dtdt']:>8.2f} {r['w_completion']:>8.2f} "
+              f"{r['avg_temp']:>9.1f}°C {r['ticks']:>8} {r['throttle_events']:>10}")
+
+    print("\nDone ✓  Run main.py to generate plots.")

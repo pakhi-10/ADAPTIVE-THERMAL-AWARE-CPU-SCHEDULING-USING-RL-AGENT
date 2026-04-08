@@ -1,0 +1,65 @@
+[
+  {
+    "label": "aggressive",
+    "avg_temp": 73.65569444444444,
+    "peak_temp": 174.6150000000001,
+    "throttle_events": 3,
+    "ticks": 54,
+    "w_dtdt": 0.01,
+    "w_completion": 3.0
+  },
+  {
+    "label": "fast",
+    "avg_temp": 74.65261160714287,
+    "peak_temp": 153.3650000000001,
+    "throttle_events": 4,
+    "ticks": 56,
+    "w_dtdt": 0.03,
+    "w_completion": 2.5
+  },
+  {
+    "label": "balanced",
+    "avg_temp": 64.04896017699114,
+    "peak_temp": 228.57500000000007,
+    "throttle_events": 1,
+    "ticks": 113,
+    "w_dtdt": 0.05,
+    "w_completion": 2.0
+  },
+  {
+    "label": "cautious",
+    "avg_temp": 69.08381637168141,
+    "peak_temp": 249.86500000000012,
+    "throttle_events": 1,
+    "ticks": 113,
+    "w_dtdt": 0.1,
+    "w_completion": 1.5
+  },
+  {
+    "label": "cool",
+    "avg_temp": 69.54381637168142,
+    "peak_temp": 251.61500000000012,
+    "throttle_events": 1,
+    "ticks": 113,
+    "w_dtdt": 0.2,
+    "w_completion": 1.0
+  },
+  {
+    "label": "very_cool",
+    "avg_temp": 69.54381637168142,
+    "peak_temp": 251.61500000000012,
+    "throttle_events": 1,
+    "ticks": 113,
+    "w_dtdt": 0.4,
+    "w_completion": 0.5
+  },
+  {
+    "label": "thermal_safe",
+    "avg_temp": 69.08381637168141,
+    "peak_temp": 249.86500000000012,
+    "throttle_events": 1,
+    "ticks": 113,
+    "w_dtdt": 0.6,
+    "w_completion": 0.2
+  }
+]
